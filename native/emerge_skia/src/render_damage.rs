@@ -73,6 +73,25 @@ impl DamageRect {
         }
     }
 
+    fn overlaps(self, other: Self) -> bool {
+        self.x < other.right()
+            && other.x < self.right()
+            && self.y < other.bottom()
+            && other.y < self.bottom()
+    }
+
+    fn contains(self, other: Self) -> bool {
+        self.x <= other.x
+            && self.y <= other.y
+            && self.right() >= other.right()
+            && self.bottom() >= other.bottom()
+    }
+
+    /// True when `self` is partly inside `rect`, so a clip to `rect` would cut it.
+    fn crosses_edge_of(self, rect: Self) -> bool {
+        self.overlaps(rect) && !rect.contains(self) && !self.contains(rect)
+    }
+
     fn touches(self, other: Self) -> bool {
         self.x <= other.right()
             && other.x <= self.right()
@@ -143,6 +162,8 @@ struct DrawItem {
     /// Visible device pixels; empty when clipped away or off the surface,
     /// `None` when the bounds are unknown.
     bounds: Option<DamageRect>,
+    /// Has partially covered edge pixels, which a clip edge can change.
+    antialiased: bool,
 }
 
 /// Flattened scene kept between frames.
@@ -175,10 +196,10 @@ impl SceneDamageState {
                 .items
                 .into_iter()
                 .map(|item| DrawItem {
-                    key: item.key,
                     bounds: item
                         .bounds
                         .map(|rect| rect.clamp_to(width, height).unwrap_or(DamageRect::EMPTY)),
+                    ..item
                 })
                 .collect(),
             globals: hasher.finish(),
@@ -249,7 +270,44 @@ impl SceneDamageState {
         if changed.is_empty() {
             return Damage::None;
         }
-        Damage::Rects(merge_rects(changed))
+        match self.expand_to_whole_items(merge_rects(changed)) {
+            Some(rects) => Damage::Rects(rects),
+            None => Damage::Full,
+        }
+    }
+
+    /// Grows `rects` until no item's edge crosses a rectangle edge. Skia's
+    /// antialiasing coverage for a shape changes slightly when a clip edge cuts
+    /// through it, so partial repaints only match full renders when every
+    /// repainted shape is either wholly inside or wholly covering the clip.
+    fn expand_to_whole_items(&self, rects: Vec<DamageRect>) -> Option<Vec<DamageRect>> {
+        const MAX_ROUNDS: usize = 16;
+        let bounds: Vec<DamageRect> = self
+            .items
+            .iter()
+            .filter(|item| item.antialiased)
+            .filter_map(|item| item.bounds)
+            .filter(|rect| !rect.is_empty())
+            .collect();
+
+        (0..MAX_ROUNDS)
+            .try_fold(rects, |rects, _| {
+                let grown: Vec<DamageRect> = rects
+                    .iter()
+                    .map(|rect| {
+                        bounds
+                            .iter()
+                            .filter(|item| item.crosses_edge_of(*rect))
+                            .fold(*rect, |acc, item| acc.union(*item))
+                    })
+                    .collect();
+                if grown == rects {
+                    Err(rects)
+                } else {
+                    Ok(merge_rects(grown))
+                }
+            })
+            .err()
     }
 }
 
@@ -292,6 +350,8 @@ struct Context {
     transform: Affine2,
     /// Device-space clip bounds, if any clip applies.
     clip: Option<Rect>,
+    /// A rounded or fractional clip applies, so edges are antialiased.
+    rounded_clip: bool,
 }
 
 impl Context {
@@ -300,6 +360,7 @@ impl Context {
             key: 0,
             transform: Affine2::identity(),
             clip: None,
+            rounded_clip: false,
         }
     }
 
@@ -327,6 +388,9 @@ impl Context {
                 (Some(outer), Some(inner)) => Some(outer.intersect(inner).unwrap_or_default()),
                 (outer, inner) => inner.or(outer),
             },
+            rounded_clip: self.rounded_clip
+                || clips.iter().any(|clip| clip.radii.is_some())
+                || !is_pixel_aligned(&self.transform, clips.iter().map(|clip| clip.rect)),
             ..next
         }
     }
@@ -461,9 +525,39 @@ impl Flattener {
             None => DamageRect::from_bounds(device),
         };
 
+        // Only an integer-aligned plain rectangle has no partially covered pixels.
+        let antialiased = context.rounded_clip
+            || match primitive {
+                DrawPrimitive::Rect(x, y, w, h, _) => !is_pixel_aligned(
+                    &context.transform,
+                    std::iter::once(Rect {
+                        x: *x,
+                        y: *y,
+                        width: *w,
+                        height: *h,
+                    }),
+                ),
+                _ => true,
+            };
+
         self.items.push(DrawItem {
             key: hasher.finish(),
             bounds,
+            antialiased,
         });
     }
+}
+
+/// True when `rects` map to whole device pixels under `transform`, which must
+/// be an integer translation.
+fn is_pixel_aligned(transform: &Affine2, mut rects: impl Iterator<Item = Rect>) -> bool {
+    let whole = |value: f32| value.fract() == 0.0;
+    transform.xx == 1.0
+        && transform.yy == 1.0
+        && transform.xy == 0.0
+        && transform.yx == 0.0
+        && whole(transform.tx)
+        && whole(transform.ty)
+        && rects
+            .all(|rect| whole(rect.x) && whole(rect.y) && whole(rect.width) && whole(rect.height))
 }

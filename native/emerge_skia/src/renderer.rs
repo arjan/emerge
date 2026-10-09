@@ -4657,27 +4657,35 @@ impl SceneRenderer {
 
     /// Render only inside `rects`, leaving the rest of the surface untouched.
     /// Only meaningful for surfaces that keep their pixels between frames.
+    ///
+    /// Each rectangle is a separate pass with a plain rectangular clip: a
+    /// multi-rectangle region clip makes Skia blend antialiased edges through
+    /// a different path, so the result would not match a full render.
     pub fn render_within(
         &mut self,
         frame: &mut RenderFrame<'_>,
         state: &RenderState,
         rects: &[crate::render_damage::DamageRect],
     ) -> RenderTimings {
-        let mut region = skia_safe::Region::new();
-        rects.iter().for_each(|rect| {
-            region.op_rect(
-                skia_safe::IRect::from_xywh(rect.x, rect.y, rect.width, rect.height),
-                skia_safe::region::RegionOp::Union,
-            );
-        });
-        let save_count = frame.surface.canvas().save();
-        frame
-            .surface
-            .canvas()
-            .clip_region(&region, skia_safe::ClipOp::Intersect);
-        let timings = self.render_with_draw_profile(frame, state, false, None);
-        frame.surface.canvas().restore_to_count(save_count);
-        timings
+        rects
+            .iter()
+            .map(|rect| {
+                let save_count = frame.surface.canvas().save();
+                frame.surface.canvas().clip_irect(
+                    skia_safe::IRect::from_xywh(rect.x, rect.y, rect.width, rect.height),
+                    skia_safe::ClipOp::Intersect,
+                );
+                let timings = self.render_with_draw_profile(frame, state, false, None);
+                frame.surface.canvas().restore_to_count(save_count);
+                timings
+            })
+            .reduce(|total, pass| RenderTimings {
+                total: total.total + pass.total,
+                draw: total.draw + pass.draw,
+                flush: total.flush + pass.flush,
+                ..total
+            })
+            .unwrap_or_default()
     }
 
     pub fn render_profiled(

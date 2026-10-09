@@ -574,6 +574,53 @@ mod tests {
             assert_eq!(damages[11], Damage::Full);
         }
 
+        /// Damage that cuts through an antialiased edge must still match a
+        /// full render; a clip edge changes Skia's edge coverage.
+        #[test]
+        fn changes_overlapping_antialiased_edges_match_full_renders() {
+            let shapes = |marker: u32| -> RenderScene {
+                let nodes = (0..6)
+                    .flat_map(|i| {
+                        let y = 6.3 + i as f32 * 25.7;
+                        [
+                            RenderNode::Primitive(DrawPrimitive::RoundedRect(
+                                10.3,
+                                y,
+                                170.6,
+                                21.9,
+                                8.0,
+                                0x334466FFu32.into(),
+                            )),
+                            RenderNode::Primitive(DrawPrimitive::Rect(
+                                20.0 + i as f32 * 25.0,
+                                y - 4.0,
+                                9.0,
+                                9.0,
+                                (marker.wrapping_mul(0x01010100 + i) | 0xFF).into(),
+                            )),
+                        ]
+                    })
+                    .collect();
+                RenderScene {
+                    nodes,
+                    ..RenderScene::default()
+                }
+            };
+            let render_state =
+                |marker| RenderState::new(shapes(marker), Color::TRANSPARENT, 1, false);
+
+            let mut incremental = backend();
+            incremental.render_damaged(&render_state(1));
+            (2..6).for_each(|marker| {
+                let (damage, _) = incremental.render_damaged(&render_state(marker));
+                let full = backend().render(&render_state(marker));
+                assert!(
+                    incremental.pixels() == full.data.as_slice(),
+                    "edge-cutting damage differs from full render ({damage:?})"
+                );
+            });
+        }
+
         #[test]
         fn small_changes_damage_small_areas() {
             let mut backend = backend();
