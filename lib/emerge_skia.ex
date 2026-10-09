@@ -196,6 +196,7 @@ defmodule EmergeSkia do
   | `pixel_format` | `:rgba8888` | Binary output format |
   | `bw1_polarity` | `:one_is_black` | `:one_is_black` or `:one_is_white` |
   | `dither` | `false` | Atkinson dithering for raster BW1/Gray2 |
+  | `partial` | `false` | Binary mode: send only the changed rectangle (see below) |
   | `target_fps` | none | Positive requested cadence |
   | `frame_message` | `:emerge_skia_frame` | Frame tuple tag |
   | `prime.drm_node` | none | Optional absolute DRM allocation node |
@@ -224,6 +225,15 @@ defmodule EmergeSkia do
   Grayscale output is composited over white before quantization. Dithering is
   available only with headless raster binary BW1/Gray2. Text, SVG/vector
   coverage, borders, and crisp generated UI are protected from error diffusion.
+
+  Raster rendering repaints only the part of the surface that changed since
+  the previous frame. With `partial: true`, binary frames carry only that
+  rectangle and arrive as `{message_tag, %VideoInterop.Frame{}, {x, y}}`, where
+  the frame is sized to the changed rectangle and `{x, y}` is its position on
+  the surface. The first frame, and any frame that changed everywhere, is full
+  size at `{0, 0}`. No message is sent when nothing changed. Partial output
+  applies to `:rgba8888` and `:bgra8888`; other formats always send full-size
+  frames at `{0, 0}`.
 
   Validate each received frame before consuming it:
 

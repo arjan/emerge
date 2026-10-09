@@ -273,7 +273,7 @@ impl GlHeadlessRenderer {
     pub(super) fn render_binary(
         &mut self,
         state: &RenderState,
-    ) -> Result<HeadlessRgbaFrame, String> {
+    ) -> Result<HeadlessRgbaFrame<'_>, String> {
         self.make_current()?;
 
         let frame_surface = self
@@ -294,7 +294,8 @@ impl GlHeadlessRenderer {
             height: height.min(self.height.max(1)),
             row_bytes: width as usize * 4,
             pixel_format: FramePixelFormat::Rgba8888Premul,
-            data,
+            data: std::borrow::Cow::Owned(data),
+            damage: Some(crate::render_damage::DamageRect::full(width, height)),
             timings,
         })
     }

@@ -47,6 +47,7 @@ mod linux_wait;
 mod native_log;
 pub mod paint_layer_payload_cache;
 pub mod render_color;
+pub mod render_damage;
 pub mod render_scene;
 pub mod renderer;
 pub mod runtime;
@@ -1061,27 +1062,45 @@ impl LatestFrameStore {
         );
     }
 
-    pub(crate) fn publish_bgra(&self, width: u32, height: u32, scale: f32, pixels: Vec<u8>) {
-        self.publish(
-            width,
-            height,
-            scale,
-            LatestFramePixelFormat::Bgra8888Premul,
-            pixels,
-        );
+    /// Updates `rect` of the stored frame from `pixels`, or stores a full copy
+    /// when there is no compatible frame yet.
+    pub(crate) fn publish_region(
+        &self,
+        width: u32,
+        height: u32,
+        pixel_format: LatestFramePixelFormat,
+        pixels: &[u8],
+        rect: crate::render_damage::DamageRect,
+    ) {
+        let mut guard = self
+            .frame
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match guard.as_mut() {
+            Some(frame)
+                if frame.width == width
+                    && frame.height == height
+                    && frame.pixel_format == pixel_format
+                    && frame.pixels.len() == pixels.len() =>
+            {
+                let row_bytes = pixels.len() / height.max(1) as usize;
+                let bpp = row_bytes / width.max(1) as usize;
+                let (start, len) = (rect.x as usize * bpp, rect.width as usize * bpp);
+                (rect.y as usize..(rect.y + rect.height) as usize).for_each(|y| {
+                    let offset = y * row_bytes + start;
+                    frame.pixels[offset..offset + len]
+                        .copy_from_slice(&pixels[offset..offset + len]);
+                });
+                frame.sequence = self
+                    .sequence
+                    .fetch_add(1, Ordering::Relaxed)
+                    .wrapping_add(1);
+            }
+            _ => *guard = Some(self.snapshot(width, height, 1.0, pixel_format, pixels.to_vec())),
+        }
     }
 
-    pub(crate) fn publish_gray8(&self, width: u32, height: u32, scale: f32, pixels: Vec<u8>) {
-        self.publish(
-            width,
-            height,
-            scale,
-            LatestFramePixelFormat::Gray8Opaque,
-            pixels,
-        );
-    }
-
-    fn publish(
+    pub(crate) fn publish(
         &self,
         width: u32,
         height: u32,
@@ -2116,6 +2135,7 @@ struct HeadlessConfig {
     pixel_format: String,
     bw1_polarity: String,
     dither: bool,
+    partial: bool,
     target_fps: Option<u32>,
     frame_message: String,
     prime: HeadlessPrimeConfig,
@@ -2151,6 +2171,7 @@ impl Default for HeadlessConfig {
             pixel_format: "rgba8888".to_string(),
             bw1_polarity: "one_is_black".to_string(),
             dither: false,
+            partial: false,
             target_fps: None,
             frame_message: "emerge_skia_frame".to_string(),
             prime: HeadlessPrimeConfig {
@@ -2225,6 +2246,7 @@ struct HeadlessConfigNif {
     pixel_format: String,
     bw1_polarity: String,
     dither: bool,
+    partial: bool,
     target_fps: Option<u32>,
     frame_message: String,
     prime: HeadlessPrimeConfigNif,
@@ -3113,6 +3135,7 @@ fn start_opts(env: Env, opts: StartOptsNif) -> NifResult<ResourceArc<RendererRes
                 pixel_format: opts.headless.pixel_format,
                 bw1_polarity: opts.headless.bw1_polarity,
                 dither: opts.headless.dither,
+                partial: opts.headless.partial,
                 target_fps: opts.headless.target_fps,
                 frame_message: opts.headless.frame_message,
                 prime: HeadlessPrimeConfig {

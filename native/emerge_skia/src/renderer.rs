@@ -4648,6 +4648,38 @@ impl SceneRenderer {
         self.render_with_draw_profile(frame, state, false, None)
     }
 
+    /// Whether `render` would take the cache-tracking path for `state`, which
+    /// may reuse layer content and is not safe to clip to damage.
+    pub fn tracks_cache(&self, state: &RenderState) -> bool {
+        state.has_cacheable_paint_layers
+            && (self.renderer_cache.enabled() || state.has_scroll_moving_paint_layers)
+    }
+
+    /// Render only inside `rects`, leaving the rest of the surface untouched.
+    /// Only meaningful for surfaces that keep their pixels between frames.
+    pub fn render_within(
+        &mut self,
+        frame: &mut RenderFrame<'_>,
+        state: &RenderState,
+        rects: &[crate::render_damage::DamageRect],
+    ) -> RenderTimings {
+        let mut region = skia_safe::Region::new();
+        rects.iter().for_each(|rect| {
+            region.op_rect(
+                skia_safe::IRect::from_xywh(rect.x, rect.y, rect.width, rect.height),
+                skia_safe::region::RegionOp::Union,
+            );
+        });
+        let save_count = frame.surface.canvas().save();
+        frame
+            .surface
+            .canvas()
+            .clip_region(&region, skia_safe::ClipOp::Intersect);
+        let timings = self.render_with_draw_profile(frame, state, false, None);
+        frame.surface.canvas().restore_to_count(save_count);
+        timings
+    }
+
     pub fn render_profiled(
         &mut self,
         frame: &mut RenderFrame<'_>,

@@ -35,7 +35,7 @@ impl FaultRenderer {
                             .unwrap();
                         Err("controlled before/after native raster draw failure".into())
                     } else {
-                        output.send(frame.unwrap().data).unwrap();
+                        output.send(frame.unwrap().data.into_owned()).unwrap();
                         Ok(())
                     }
                 },

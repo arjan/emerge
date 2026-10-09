@@ -638,6 +638,55 @@ defmodule EmergeSkiaTest do
     assert pixels == :binary.copy(<<10, 20, 30, 255>>, 4)
   end
 
+  test "headless partial output sends only changed rectangles" do
+    {:ok, renderer} =
+      EmergeSkia.start(
+        otp_app: :emerge,
+        backend: :headless,
+        rendering_api: :raster,
+        width: 40,
+        height: 40,
+        headless: [target: self(), pixel_format: :rgba8888, partial: true]
+      )
+
+    on_exit(fn -> EmergeSkia.stop(renderer) end)
+
+    tree = fn color ->
+      column([width(px(40)), height(px(40)), Emerge.UI.Background.color(:black)], [
+        el([width(px(40)), height(px(10)), Emerge.UI.Background.color(:white)], none()),
+        el([width(px(10)), height(px(10)), Emerge.UI.Background.color(color)], none())
+      ])
+    end
+
+    {state, _assigned} = EmergeSkia.upload_tree(renderer, tree.(:red))
+
+    assert_receive {:emerge_skia_frame, %Frame{coded_width: 40, coded_height: 40} = first,
+                    {0, 0}},
+                   1_000
+
+    assert :ok = VideoInterop.validate(first)
+
+    {state, _assigned} = EmergeSkia.patch_tree(renderer, state, tree.(:blue))
+
+    assert_receive {:emerge_skia_frame, %Frame{coded_width: w, coded_height: h} = frame, {x, y}},
+                   1_000
+
+    assert :ok = VideoInterop.validate(frame)
+    assert w < 40 and h < 40
+    assert x >= 0 and y >= 8
+    %Binary{data: data, planes: [%Plane{stride: stride}]} = frame.storage
+    assert stride == w * 4
+    # The changed square is blue inside the reported rectangle.
+    blue_offset = (10 + 5 - y) * stride + (5 - x) * 4
+    assert <<0, 0, 255, 255>> = binary_part(data, blue_offset, 4)
+
+    assert {:ok, pixels} = EmergeSkia.render_to_pixels(renderer)
+    assert <<0, 0, 255, 255>> = binary_part(pixels, (15 * 40 + 5) * 4, 4)
+
+    {_state, _assigned} = EmergeSkia.patch_tree(renderer, state, tree.(:blue))
+    refute_receive {:emerge_skia_frame, _frame, _position}, 200
+  end
+
   test "headless BW1 packs rows independently and expands Gray8 screenshots" do
     {:ok, renderer} =
       EmergeSkia.start(

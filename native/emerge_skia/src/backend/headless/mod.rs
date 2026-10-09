@@ -19,9 +19,11 @@ use self::output::{
     FramePixelFormat, FrameSource, convert_packed_gray_into, packed_gray_output_len, rgba_at,
 };
 
+use crate::render_damage::DamageRect;
 use crate::{
-    BackendKind, HeadlessConfig, InputTargetRelay, LatestFrameStore, RenderSender, RendererHandles,
-    RendererResource, RendererRuntimeInfo, RenderingApi, StartConfig, VideoWake,
+    BackendKind, HeadlessConfig, InputTargetRelay, LatestFramePixelFormat, LatestFrameStore,
+    RenderSender, RendererHandles, RendererResource, RendererRuntimeInfo, RenderingApi,
+    StartConfig, VideoWake,
     actors::{RenderMsg, TreeMsg},
     assets,
     backend::{
@@ -444,6 +446,17 @@ fn run_render_loop(
             frame_interval,
             |state, render_started_at| {
                 sync_headless_video(&mut renderer, state, &video_registry);
+                let packed_bits = match headless.pixel_format.as_str() {
+                    "bw1" => Some(1),
+                    "gray2" => Some(2),
+                    _ => None,
+                };
+                // Rendered before the frame, which borrows the renderer.
+                let policy = if packed_bits.is_some() && headless.dither {
+                    Some(renderer.render_grayscale_dither_policy(state))
+                } else {
+                    None
+                };
                 let frame = renderer.render_binary(state)?;
                 record_render_stats(
                     stats.as_deref(),
@@ -453,10 +466,20 @@ fn run_render_loop(
                     frame_interval,
                 );
                 let sequence = state.render_version.wrapping_add(1);
-                let packed_bits = match headless.pixel_format.as_str() {
-                    "bw1" => Some(1),
-                    "gray2" => Some(2),
-                    _ => None,
+                let full = DamageRect::full(frame.width, frame.height);
+                // Partial output sends only the changed rectangle; nothing at all
+                // when nothing changed. Other formats always send whole frames.
+                let partial_rect = match frame.damage {
+                    _ if !headless.partial => Some(full),
+                    None => return Ok(()),
+                    Some(rect)
+                        if packed_bits.is_none()
+                            && headless.pixel_format != "rgb888"
+                            && headless.pixel_format != "gray8" =>
+                    {
+                        Some(rect)
+                    }
+                    Some(_) => Some(full),
                 };
                 let source = FrameSource {
                     data: &frame.data,
@@ -466,12 +489,7 @@ fn run_render_loop(
                     format: frame.pixel_format,
                 };
                 let converted = if let Some(bits) = packed_bits {
-                    let policy = if headless.dither {
-                        renderer.render_grayscale_dither_policy(state).map(Some)
-                    } else {
-                        Ok(None)
-                    };
-                    policy.and_then(|policy| {
+                    policy.transpose().and_then(|policy| {
                         let mut binary = new_frame_binary(packed_gray_output_len(
                             frame.width,
                             frame.height,
@@ -487,28 +505,35 @@ fn run_render_loop(
                         Ok((binary, stride))
                     })
                 } else {
-                    convert_frame(source, &headless.pixel_format)
+                    match partial_rect {
+                        Some(rect) if rect != full => crop_frame(source, rect),
+                        _ => convert_frame(source, &headless.pixel_format),
+                    }
                 };
 
-                match frame.pixel_format {
-                    FramePixelFormat::Rgba8888Premul => {
-                        latest_frame.publish_rgba(frame.width, frame.height, 1.0, frame.data)
+                let latest_format = match frame.pixel_format {
+                    FramePixelFormat::Rgba8888Premul => LatestFramePixelFormat::Rgba8888Premul,
+                    FramePixelFormat::Bgra8888Premul => LatestFramePixelFormat::Bgra8888Premul,
+                    FramePixelFormat::Gray8Opaque => LatestFramePixelFormat::Gray8Opaque,
+                };
+                match (frame.data, frame.damage) {
+                    (std::borrow::Cow::Owned(pixels), _) => {
+                        latest_frame.publish(frame.width, frame.height, 1.0, latest_format, pixels)
                     }
-                    FramePixelFormat::Bgra8888Premul => {
-                        latest_frame.publish_bgra(frame.width, frame.height, 1.0, frame.data)
-                    }
-                    FramePixelFormat::Gray8Opaque => {
-                        latest_frame.publish_gray8(frame.width, frame.height, 1.0, frame.data)
-                    }
+                    (std::borrow::Cow::Borrowed(pixels), Some(rect)) => latest_frame
+                        .publish_region(frame.width, frame.height, latest_format, pixels, rect),
+                    (std::borrow::Cow::Borrowed(_), None) => {}
                 }
 
+                let rect = partial_rect.unwrap_or(full);
                 match converted {
                     Ok((data, stride_bytes)) => send_binary_frame(
                         target,
                         &headless.frame_message,
                         sequence,
-                        frame.width,
-                        frame.height,
+                        rect.width as u32,
+                        rect.height as u32,
+                        headless.partial.then_some((rect.x, rect.y)),
                         &headless.pixel_format,
                         &headless.bw1_polarity,
                         stride_bytes,
@@ -757,12 +782,15 @@ fn effective_renderer_cache_config(
     config
 }
 
-struct HeadlessRgbaFrame {
+struct HeadlessRgbaFrame<'a> {
     width: u32,
     height: u32,
     row_bytes: usize,
     pixel_format: FramePixelFormat,
-    data: Vec<u8>,
+    data: std::borrow::Cow<'a, [u8]>,
+    /// Bounds of the pixels that changed since the previous frame; `None`
+    /// when nothing changed.
+    damage: Option<DamageRect>,
     timings: RenderTimings,
 }
 
@@ -965,7 +993,7 @@ impl HeadlessRenderer {
         }
     }
 
-    fn render_binary(&mut self, state: &RenderState) -> Result<HeadlessRgbaFrame, String> {
+    fn render_binary(&mut self, state: &RenderState) -> Result<HeadlessRgbaFrame<'_>, String> {
         match self {
             Self::Raster(renderer) => Ok(renderer.render(state)),
             #[cfg(all(target_os = "linux", feature = "headless-opengl"))]
@@ -1073,18 +1101,19 @@ impl RasterHeadlessRenderer {
         })
     }
 
-    fn render(&mut self, state: &RenderState) -> HeadlessRgbaFrame {
-        let (frame, timings) = self.renderer.render_with_timings(state);
+    fn render(&mut self, state: &RenderState) -> HeadlessRgbaFrame<'_> {
+        let (damage, timings) = self.renderer.render_damaged(state);
         HeadlessRgbaFrame {
             width: self.width,
             height: self.height,
-            row_bytes: frame.row_bytes,
-            pixel_format: match frame.format {
+            row_bytes: self.renderer.row_bytes(),
+            pixel_format: match self.renderer.format() {
                 RasterPixelFormat::Rgba8888Premul => FramePixelFormat::Rgba8888Premul,
                 RasterPixelFormat::Bgra8888Premul => FramePixelFormat::Bgra8888Premul,
                 RasterPixelFormat::Gray8Opaque => FramePixelFormat::Gray8Opaque,
             },
-            data: frame.data,
+            data: std::borrow::Cow::Borrowed(self.renderer.pixels()),
+            damage: damage.bounds(self.width, self.height),
             timings,
         }
     }
@@ -1097,6 +1126,7 @@ fn send_binary_frame(
     sequence: u64,
     width: u32,
     height: u32,
+    position: Option<(i32, i32)>,
     pixel_format: &str,
     bw1_polarity: &str,
     stride_bytes: u32,
@@ -1169,7 +1199,14 @@ fn send_binary_frame(
             lease: None::<Atom>.encode(inner_env),
         }
         .encode(inner_env);
-        encode_frame_message(inner_env, use_default_message, &frame_message, frame)
+        let message = encode_frame_message(inner_env, use_default_message, &frame_message, frame);
+        match position {
+            Some((x, y)) => {
+                let (tag, frame): (Term, Term) = message.decode().expect("frame message tuple");
+                (tag, frame, (x, y)).encode(inner_env)
+            }
+            None => message,
+        }
     });
 }
 
@@ -1253,6 +1290,22 @@ fn encode_frame_message<'a>(
     } else {
         (frame_message, frame).encode(env)
     }
+}
+
+/// Copies `rect` out of a 4-byte-per-pixel frame into a BEAM binary.
+fn crop_frame(source: FrameSource<'_>, rect: DamageRect) -> Result<(OwnedBinary, u32), String> {
+    let bpp = 4;
+    let (start, len) = (rect.x as usize * bpp, rect.width as usize * bpp);
+    let mut binary = new_frame_binary(len * rect.height as usize)?;
+    binary
+        .as_mut_slice()
+        .chunks_exact_mut(len.max(1))
+        .zip(rect.y as usize..)
+        .for_each(|(out, y)| {
+            let offset = y * source.row_bytes + start;
+            out.copy_from_slice(&source.data[offset..offset + len]);
+        });
+    Ok((binary, len as u32))
 }
 
 fn new_frame_binary(len: usize) -> Result<OwnedBinary, String> {

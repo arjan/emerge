@@ -301,10 +301,10 @@ impl Harness {
                         "retained damage must match a fresh raster surface"
                     );
                     if self.render_tap.is_some() {
-                        self.last_pixels = a.data.clone();
+                        self.last_pixels = a.data.to_vec();
                     }
                     if self.retained.is_none() {
-                        self.retained = Some((output.scene, a.data));
+                        self.retained = Some((output.scene, a.data.into_owned()));
                     }
                     self.frames += 1;
                 }
@@ -442,6 +442,7 @@ fn actor_direct_and_raster_headless_match_focus_ime_drag_wheel_nearby_and_final_
         h.actor_raster
             .render(&RenderState::new(scene, Color::TRANSPARENT, 10_000, false))
             .data
+            .into_owned()
     );
 }
 
@@ -506,7 +507,7 @@ fn delayed_registry_install_replays_keyboard_ime_and_wheel_during_animation_with
         assert!(h.deferred.is_empty());
         let (scene, old_pixels) = h.retained.take().unwrap();
         let retained = RenderState::new(scene, Color::TRANSPARENT, 0, false);
-        assert_eq!(raster().render(&retained).data, old_pixels);
+        assert_eq!(raster().render(&retained).data.into_owned(), old_pixels);
     }
 }
 
@@ -597,7 +598,8 @@ fn delayed_pointer_release_and_nearby_hover_match_actor_and_headless_damage() {
         assert_eq!(
             raster()
                 .render(&RenderState::new(scene, Color::TRANSPARENT, 0, false))
-                .data,
+                .data
+                .into_owned(),
             pixels
         );
     }
@@ -666,7 +668,8 @@ fn queued_old_mount_edit_matches_actor_and_headless_after_replacement() {
     assert_eq!(
         raster()
             .render(&RenderState::new(scene, Color::TRANSPARENT, 0, false))
-            .data,
+            .data
+            .into_owned(),
         pixels
     );
 }

@@ -416,6 +416,10 @@ defmodule EmergeSkia.Options do
         opts
         |> Keyword.get(:dither, false)
         |> normalize_boolean!(":headless.dither"),
+      partial:
+        opts
+        |> Keyword.get(:partial, false)
+        |> normalize_boolean!(":headless.partial"),
       target_fps:
         opts
         |> Keyword.get(:target_fps)
